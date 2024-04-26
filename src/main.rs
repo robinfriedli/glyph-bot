@@ -7,6 +7,15 @@ use futures::{future::BoxFuture, FutureExt};
 use lazy_static::lazy_static;
 use rustls::pki_types::CertificateDer;
 
+pub mod model;
+pub mod schema;
+
+#[cfg(feature = "auto_migration")]
+use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
+
+#[cfg(feature = "auto_migration")]
+pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+
 lazy_static! {
     pub static ref DATABASE_URL: String = std::env::var("GLYPH_DATABASE_URL").expect(
         "Missing environment variable GLYPH_DATABASE_URL must be set to connect to postgres"
@@ -58,6 +67,18 @@ fn main() {
     lazy_static::initialize(&CONNECTION_POOL);
 
     setup_logger();
+
+    #[cfg(feature = "auto_migration")]
+    {
+        use diesel::Connection;
+        log::info!("Running diesel migrations");
+        let mut connection = diesel::pg::PgConnection::establish(&DATABASE_URL)
+            .expect("Failed to acquire database connection");
+        if let Err(e) = connection.run_pending_migrations(MIGRATIONS) {
+            panic!("Failed running db migrations: {}", e);
+        }
+        log::info!("Done running diesel migrations");
+    }
 }
 
 // enable TLS for AsyncPgConnection, see https://github.com/weiznich/diesel_async/blob/main/examples/postgres/pooled-with-rustls
