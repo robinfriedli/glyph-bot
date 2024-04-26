@@ -12,3 +12,9 @@ pub struct AiodeSupporter {
     pub user_id: BigDecimal,
     pub creation_timestamp: DateTime<Utc>,
 }
+
+#[derive(Clone, Debug, Insertable)]
+#[diesel(table_name = aiode_supporter)]
+pub struct NewAiodeSupporter {
+    pub user_id: BigDecimal,
+}

@@ -1,17 +1,28 @@
 use std::{fs, io};
 
 use diesel::{ConnectionError, ConnectionResult};
-use diesel_async::{pooled_connection::{deadpool::Pool, AsyncDieselConnectionManager, ManagerConfig}, AsyncPgConnection};
+use diesel_async::{
+    pooled_connection::{
+        deadpool::{Object, Pool},
+        AsyncDieselConnectionManager, ManagerConfig,
+    },
+    AsyncPgConnection,
+};
 use dotenvy::dotenv;
+use error::Error;
+use event_handler::DiscordEventHandler;
 use futures::{future::BoxFuture, FutureExt};
 use lazy_static::lazy_static;
 use rustls::pki_types::CertificateDer;
 
+pub mod error;
+pub mod event_handler;
 pub mod model;
 pub mod schema;
 
 #[cfg(feature = "auto_migration")]
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
+use serenity::all::GatewayIntents;
 
 #[cfg(feature = "auto_migration")]
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
@@ -25,8 +36,7 @@ lazy_static! {
             .parse::<bool>()
             .expect("GLYPH_PG_ENABLE_SSL is not a valid boolean"))
         .unwrap_or_default();
-    pub static ref PG_SSL_CERT_PATH: Option<String> =
-        std::env::var("GLYPH_PG_SSL_CERT_PATH").ok();
+    pub static ref PG_SSL_CERT_PATH: Option<String> = std::env::var("GLYPH_PG_SSL_CERT_PATH").ok();
     pub static ref CONNECTION_POOL: Pool<AsyncPgConnection> = {
         let database_connection_manager = if *PG_ENABLE_SSL {
             let mut config = ManagerConfig::default();
@@ -47,6 +57,30 @@ lazy_static! {
             .build()
             .expect("Failed to initialise connection pool")
     };
+    pub static ref DISCORD_TOKEN: String = std::env::var("GLYPH_DISCORD_TOKEN").expect(
+        "Missing environment variable GLYPH_DISCORD_TOKEN must be set to connect to discord"
+    );
+    pub static ref AIODE_SUPPORT_GUILD_ID: Option<u64> =
+        std::env::var("GLYPH_AIODE_SUPPORT_GUILD_ID")
+            .map(|val| val
+                .parse::<u64>()
+                .expect("GLYPH_AIODE_SUPPORT_GUILD_ID is not a valid u64"))
+            .ok();
+    pub static ref AIODE_SUPPORTER_ROLE_ID: Option<u64> =
+        std::env::var("GLYPH_AIODE_SUPPORTER_ROLE_ID")
+            .map(|val| val
+                .parse::<u64>()
+                .expect("GLYPH_AIODE_SUPPORTER_ROLE_ID is not a valid u64"))
+            .ok();
+}
+
+pub type DbConnection = Object<AsyncPgConnection>;
+
+pub async fn acquire_db_connection() -> Result<DbConnection, Error> {
+    CONNECTION_POOL
+        .get()
+        .await
+        .map_err(|e| Error::DatabaseConnectionError(e.to_string()))
 }
 
 fn main() {
@@ -78,6 +112,22 @@ fn main() {
             panic!("Failed running db migrations: {}", e);
         }
         log::info!("Done running diesel migrations");
+    }
+
+    setup_tokio_runtime();
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn setup_tokio_runtime() {
+    let intents = GatewayIntents::all();
+
+    let mut client = serenity::Client::builder(&*DISCORD_TOKEN, intents)
+        .event_handler(DiscordEventHandler)
+        .await
+        .expect("Failed to create serenity client");
+
+    if let Err(why) = client.start().await {
+        log::error!("An error occurred while starting the serenity client: {why:?}");
     }
 }
 
@@ -147,8 +197,10 @@ fn setup_logger() {
             ))
         })
         .level(log::LevelFilter::Info)
-        .level_for("filebroker", logging_level)
-        .level_for("filebroker_server", logging_level)
+        .level_for("glyph_bot", logging_level)
+        .level_for("tracing::span", log::LevelFilter::Warn)
+        .level_for("serenity::gateway", log::LevelFilter::Warn)
+        .level_for("serenity::http", log::LevelFilter::Warn)
         .chain(std::io::stdout())
         .chain(fern::DateBased::new("logs/", "logs_%Y-%m-%d.log"))
         .apply()
