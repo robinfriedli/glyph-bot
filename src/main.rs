@@ -56,6 +56,8 @@ fn main() {
     dotenv().ok();
 
     lazy_static::initialize(&CONNECTION_POOL);
+
+    setup_logger();
 }
 
 // enable TLS for AsyncPgConnection, see https://github.com/weiznich/diesel_async/blob/main/examples/postgres/pooled-with-rustls
@@ -99,4 +101,35 @@ fn load_certs(cert_path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
 
     let certs = rustls_pemfile::certs(&mut reader);
     certs.collect()
+}
+
+fn setup_logger() {
+    // create logs dir as fern does not appear to handle that itself
+    if !std::path::Path::new("logs/").exists() {
+        std::fs::create_dir("logs").expect("Failed to create logs/ directory");
+    }
+
+    let logging_level = if cfg!(debug_assertions) {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    };
+
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{}]{}[{}] {}",
+                record.level(),
+                chrono::Local::now().format("[%Y-%m-%d %H:%M:%S]"),
+                record.target(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Info)
+        .level_for("filebroker", logging_level)
+        .level_for("filebroker_server", logging_level)
+        .chain(std::io::stdout())
+        .chain(fern::DateBased::new("logs/", "logs_%Y-%m-%d.log"))
+        .apply()
+        .expect("Failed to set up logging");
 }
