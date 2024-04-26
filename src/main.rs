@@ -1,5 +1,7 @@
-use std::{fs, io};
+use std::{fs, io, thread::JoinHandle};
 
+use chrono::Utc;
+use clokwerk::Scheduler;
 use diesel::{ConnectionError, ConnectionResult};
 use diesel_async::{
     pooled_connection::{
@@ -19,6 +21,7 @@ pub mod error;
 pub mod event_handler;
 pub mod model;
 pub mod schema;
+pub mod task;
 
 #[cfg(feature = "auto_migration")]
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
@@ -114,6 +117,8 @@ fn main() {
         log::info!("Done running diesel migrations");
     }
 
+    let _task_scheduler = start_task_scheduler_runtime(configure_scheduler());
+
     setup_tokio_runtime();
 }
 
@@ -172,6 +177,55 @@ fn load_certs(cert_path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
 
     let certs = rustls_pemfile::certs(&mut reader);
     certs.collect()
+}
+
+fn configure_scheduler() -> Scheduler<Utc> {
+    let mut scheduler = Scheduler::with_tz(Utc);
+    scheduler
+        .every(clokwerk::Interval::Minutes(5))
+        .run(|| task::submit_task("refresh_aiode_supporters", task::refresh_aiode_supporters));
+
+    scheduler
+}
+
+fn start_task_scheduler_runtime(scheduler: Scheduler<Utc>) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(String::from("task_scheduler"))
+        .spawn(move || {
+            let mut task_scheduler_sentinel = TaskSchedulerSentinel { scheduler };
+
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .thread_name("task_tokio_worker")
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    eprintln!("Failed to start task scheduler runtime: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            runtime.block_on(async {
+                loop {
+                    task_scheduler_sentinel.scheduler.run_pending();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            });
+        })
+        .expect("Failed to spawn task scheduler thread")
+}
+
+struct TaskSchedulerSentinel {
+    scheduler: Scheduler<Utc>,
+}
+
+impl Drop for TaskSchedulerSentinel {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            start_task_scheduler_runtime(configure_scheduler());
+        }
+    }
 }
 
 fn setup_logger() {
