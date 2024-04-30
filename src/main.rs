@@ -1,4 +1,8 @@
-use std::{fs, io, thread::JoinHandle};
+use std::{
+    fs, io,
+    str::FromStr,
+    thread::{self, JoinHandle},
+};
 
 use chrono::Utc;
 use clokwerk::Scheduler;
@@ -17,15 +21,20 @@ use futures::{future::BoxFuture, FutureExt};
 use lazy_static::lazy_static;
 use rustls::pki_types::CertificateDer;
 
+pub mod aiode;
 pub mod error;
 pub mod event_handler;
 pub mod model;
 pub mod schema;
 pub mod task;
+pub mod util;
 
 #[cfg(feature = "auto_migration")]
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
 use serenity::all::GatewayIntents;
+use warp::Filter;
+
+use crate::util::OptFmt;
 
 #[cfg(feature = "auto_migration")]
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
@@ -75,6 +84,11 @@ lazy_static! {
                 .parse::<u64>()
                 .expect("GLYPH_AIODE_SUPPORTER_ROLE_ID is not a valid u64"))
             .ok();
+    pub static ref API_PORT: u16 = {
+        let port_str = std::env::var("GLYPH_API_PORT")
+            .expect("Missing environment variable GLYPH_API_PORT must be set.");
+        u16::from_str(&port_str).expect("GLYPH_API_PORT var is not a valid u16 value")
+    };
 }
 
 pub type DbConnection = Object<AsyncPgConnection>;
@@ -119,11 +133,18 @@ fn main() {
 
     let _task_scheduler = start_task_scheduler_runtime(configure_scheduler());
 
-    setup_tokio_runtime();
+    thread::Builder::new()
+        .name(String::from("api_thread"))
+        .spawn(|| {
+            setup_warp_runtime();
+        })
+        .expect("Failed to spawn api thread");
+
+    setup_serenity_runtime();
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn setup_tokio_runtime() {
+async fn setup_serenity_runtime() {
     let intents = GatewayIntents::all();
 
     let mut client = serenity::Client::builder(&*DISCORD_TOKEN, intents)
@@ -134,6 +155,43 @@ async fn setup_tokio_runtime() {
     if let Err(why) = client.start().await {
         log::error!("An error occurred while starting the serenity client: {why:?}");
     }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn setup_warp_runtime() {
+    let check_is_aiode_supporter = warp::path!("is-aiode-supporter" / u64)
+        .and(warp::get())
+        .and_then(aiode::check_is_aiode_supporter_handler);
+
+    let routes = check_is_aiode_supporter;
+
+    let filter = routes
+        .recover(error::handle_rejection)
+        .with(warp::log::custom(|info| {
+            let log_level = if info.elapsed().as_secs() >= 10 {
+                log::Level::Warn
+            } else if info.elapsed().as_millis() >= 250 || !info.status().is_success() {
+                log::Level::Info
+            } else {
+                log::Level::Debug
+            };
+
+            log::log!(
+                target: "glyph_bot::api",
+                log_level,
+                "{} \"{} {} {:?}\" {} \"{}\" \"{}\" {:?}",
+                OptFmt(info.remote_addr()),
+                info.method(),
+                info.path(),
+                info.version(),
+                info.status().as_u16(),
+                OptFmt(info.referer()),
+                OptFmt(info.user_agent()),
+                info.elapsed(),
+            );
+        }));
+
+    warp::serve(filter).run(([127, 0, 0, 1], *API_PORT)).await;
 }
 
 // enable TLS for AsyncPgConnection, see https://github.com/weiznich/diesel_async/blob/main/examples/postgres/pooled-with-rustls
